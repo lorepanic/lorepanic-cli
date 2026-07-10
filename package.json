@@ -1,0 +1,46 @@
+{
+  "name": "lorepanic",
+  "version": "0.1.1",
+  "description": "Sync your LorePanic campaigns to a local folder your coding agent can work with",
+  "homepage": "https://lorepanic.com",
+  "author": {
+    "name": "Georges Mahl",
+    "email": "contact@lorepanic.com"
+  },
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "lorepanic": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "prepack": "npm run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lorepanic/lorepanic-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lorepanic/lorepanic-cli/issues"
+  },
+  "keywords": [
+    "ttrpg",
+    "dnd",
+    "gamemaster",
+    "campaign",
+    "claude-code",
+    "agents"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
