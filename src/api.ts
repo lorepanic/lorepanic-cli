@@ -3,9 +3,23 @@ export class ApiError extends Error {
     public status: number,
     public body: string,
     message?: string,
+    /** Seconds from the Retry-After header, when the server sent one. */
+    public retryAfter: number | null = null,
   ) {
     super(message ?? `API error ${status}: ${body.slice(0, 300)}`);
   }
+}
+
+/** The server could not be reached at all (DNS, offline, connection reset). */
+export class NetworkError extends Error {}
+
+function parseRetryAfter(value: string | null): number | null {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds;
+  const date = Date.parse(value);
+  if (!Number.isNaN(date)) return Math.max(0, (date - Date.now()) / 1000);
+  return null;
 }
 
 export class ApiClient {
@@ -30,9 +44,16 @@ export class ApiClient {
         body: body !== undefined ? JSON.stringify(body) : undefined,
       });
     } catch (e) {
-      throw new Error(`Could not reach ${this.baseUrl}: ${(e as Error).message}`);
+      throw new NetworkError(`Could not reach ${this.baseUrl}: ${(e as Error).message}`);
     }
-    if (!res.ok) throw new ApiError(res.status, await res.text());
+    if (!res.ok) {
+      throw new ApiError(
+        res.status,
+        await res.text(),
+        undefined,
+        parseRetryAfter(res.headers.get("Retry-After")),
+      );
+    }
     return res;
   }
 
@@ -69,7 +90,7 @@ export interface DeviceStart {
 }
 
 export interface DevicePoll {
-  status: "pending" | "connected" | "expired" | "denied";
+  status: "pending" | "slow_down" | "connected" | "expired" | "denied";
   token: string | null;
   token_expires_at: string | null;
   scopes: string[] | null;

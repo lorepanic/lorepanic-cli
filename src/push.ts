@@ -65,120 +65,169 @@ export async function push(opts: PushOptions): Promise<void> {
     if (file) idByPath.set(file.path, id);
   }
 
-  const stats = { created: 0, updated: 0, unchanged: 0, conflicts: 0, deleted: 0 };
+  const stats = { created: 0, updated: 0, unchanged: 0, conflicts: 0, deleted: 0, skipped: 0 };
   const seenIds = new Set<string>();
 
-  for (const abs of listMarkdownFiles(join(root, "notes"))) {
-    const rel = relative(root, abs).split("\\").join("/");
-    const raw = readFileSync(abs, "utf-8");
-    const parsed = parseFrontMatter(raw);
-    const id = (parsed?.fields["id"] as string | undefined) ?? idByPath.get(rel);
-    const body = (parsed ? parsed.body : raw).replace(/\n$/, "");
+  // Server-side notes of this campaign, fetched lazily the first time a file
+  // carries an id that state.json doesn't know (e.g. state was lost after a
+  // crash between a create and the state write). Scoping the lookup to the
+  // campaign keeps a file copied from another workspace from overwriting a
+  // note in a different campaign.
+  let remoteNotes: Map<string, NoteResponse> | null = null;
+  const campaignNote = async (id: string): Promise<NoteResponse | undefined> => {
+    if (!remoteNotes) {
+      const list = await api.get<NoteResponse[]>(`/api/notes/campaigns/${state.campaignId}`);
+      remoteNotes = new Map(list.map((n) => [n.id, n]));
+    }
+    return remoteNotes.get(id);
+  };
 
-    if (id && state.entities[id]) {
-      seenIds.add(id);
-      const entity = state.entities[id];
-      const prevFile = entity.files["content"];
-      if (prevFile && prevFile.path === rel && sha256(raw) === prevFile.hash) {
-        stats.unchanged += 1;
+  try {
+    for (const abs of listMarkdownFiles(join(root, "notes"))) {
+      const rel = relative(root, abs).split("\\").join("/");
+      const raw = readFileSync(abs, "utf-8");
+      const parsed = parseFrontMatter(raw);
+      const id = (parsed?.fields["id"] as string | undefined) ?? idByPath.get(rel);
+      const body = (parsed ? parsed.body : raw).replace(/\n$/, "");
+
+      if (id) {
+        seenIds.add(id);
+        let baseUpdatedAt: string | undefined;
+        const entity = state.entities[id];
+        if (entity) {
+          const prevFile = entity.files["content"];
+          if (prevFile && prevFile.path === rel && sha256(raw) === prevFile.hash) {
+            stats.unchanged += 1;
+            continue;
+          }
+          baseUpdatedAt = entity.updated_at;
+        } else {
+          // Known id, unknown to state: update in place, never duplicate.
+          if (!(await campaignNote(id))) {
+            console.log(
+              `  ! ${rel}: note ${id} doesn't exist in this campaign on the server. ` +
+                "Remove the `id:` front-matter line to create it as a new note.",
+            );
+            stats.skipped += 1;
+            continue;
+          }
+          const fmUpdated = parsed?.fields["updated_at"];
+          baseUpdatedAt = typeof fmUpdated === "string" && fmUpdated ? fmUpdated : undefined;
+          if (!baseUpdatedAt && !opts.force) {
+            console.log(
+              `  ! ${rel}: no local sync record for this note. Run \`lorepanic pull\` to ` +
+                "get a .remote.md copy, merge, then `lorepanic push --force`.",
+            );
+            stats.conflicts += 1;
+            continue;
+          }
+        }
+
+        const payload: Record<string, unknown> = {
+          title: (parsed?.fields["title"] as string | undefined) ?? titleFromBody(body, rel),
+          content: body,
+        };
+        if (parsed?.fields["note_type"]) payload["note_type"] = parsed.fields["note_type"];
+        if (!opts.force && baseUpdatedAt) payload["expected_updated_at"] = baseUpdatedAt;
+
+        let note: NoteResponse;
+        try {
+          note = await api.put<NoteResponse>(`/api/notes/${id}`, payload);
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 409) {
+            console.log(
+              `  ! ${rel}: the note changed on the server. Run \`lorepanic pull\` to get a ` +
+                `.remote.md copy, merge, then \`lorepanic push --force\`.`,
+            );
+            stats.conflicts += 1;
+            continue;
+          }
+          throw e;
+        }
+
+        const content = noteFile(note, body);
+        writeFileSync(abs, content);
+        state.entities[id] = {
+          type: "note",
+          updated_at: note.updated_at,
+          files: { content: { path: rel, hash: sha256(content) } },
+        };
+        // Persist right away: a crash later in the run must not forget that
+        // this file is now in sync.
+        saveState(root, state);
+        const remote = abs.replace(/\.md$/, ".remote.md");
+        if (opts.force && existsSync(remote)) unlinkSync(remote);
+        console.log(`  ^ ${rel}`);
+        stats.updated += 1;
         continue;
       }
 
-      const payload: Record<string, unknown> = {
-        title: (parsed?.fields["title"] as string | undefined) ?? titleFromBody(body, rel),
+      // New note.
+      const note = await api.post<NoteResponse>(`/api/notes/campaigns/${state.campaignId}`, {
+        title: (parsed?.fields["title"] as string | undefined) ?? titleFromBody(body, rel.replace(/^notes\//, "").replace(/\.md$/, "")),
         content: body,
-      };
-      if (parsed?.fields["note_type"]) payload["note_type"] = parsed.fields["note_type"];
-      if (!opts.force) payload["expected_updated_at"] = entity.updated_at;
-
-      let note: NoteResponse;
-      try {
-        note = await api.put<NoteResponse>(`/api/notes/${id}`, payload);
-      } catch (e) {
-        if (e instanceof ApiError && e.status === 409) {
-          console.log(
-            `  ! ${rel}: the note changed on the server. Run \`lorepanic pull\` to get a ` +
-              `.remote.md copy, merge, then \`lorepanic push --force\`.`,
-          );
-          stats.conflicts += 1;
-          continue;
-        }
-        throw e;
-      }
-
+        note_type: (parsed?.fields["note_type"] as string | undefined) ?? "gm",
+      });
+      seenIds.add(note.id);
       const content = noteFile(note, body);
       writeFileSync(abs, content);
-      state.entities[id] = {
+      state.entities[note.id] = {
         type: "note",
         updated_at: note.updated_at,
         files: { content: { path: rel, hash: sha256(content) } },
       };
-      const remote = abs.replace(/\.md$/, ".remote.md");
-      if (opts.force && existsSync(remote)) unlinkSync(remote);
-      console.log(`  ^ ${rel}`);
-      stats.updated += 1;
-      continue;
+      // Persist right away so a failure on a later file can't make the next
+      // push re-create this note.
+      saveState(root, state);
+      console.log(`  + ${rel} (created on server)`);
+      stats.created += 1;
     }
 
-    // New note.
-    const note = await api.post<NoteResponse>(`/api/notes/campaigns/${state.campaignId}`, {
-      title: (parsed?.fields["title"] as string | undefined) ?? titleFromBody(body, rel.replace(/^notes\//, "").replace(/\.md$/, "")),
-      content: body,
-      note_type: (parsed?.fields["note_type"] as string | undefined) ?? "gm",
-    });
-    seenIds.add(note.id);
-    const content = noteFile(note, body);
-    writeFileSync(abs, content);
-    state.entities[note.id] = {
-      type: "note",
-      updated_at: note.updated_at,
-      files: { content: { path: rel, hash: sha256(content) } },
-    };
-    console.log(`  + ${rel} (created on server)`);
-    stats.created += 1;
-  }
-
-  // Notes tracked in state whose local file disappeared.
-  for (const [id, entity] of Object.entries(state.entities)) {
-    if (entity.type !== "note" || seenIds.has(id)) continue;
-    const file = entity.files["content"];
-    if (!file) continue;
-    const abs = safeResolve(root, file.path);
-    if (!abs) {
-      console.log(`  ! state entry for ${file.path} points outside the workspace; ignored`);
-      continue;
-    }
-    if (existsSync(abs)) continue;
-    if (opts.prune) {
-      try {
-        await api.delete(
-          `/api/notes/${id}?expected_updated_at=${encodeURIComponent(entity.updated_at)}`,
-        );
-      } catch (e) {
-        if (e instanceof ApiError && e.status === 409) {
-          console.log(
-            `  ! ${file.path}: the note changed on the server since your last pull; ` +
-              `run \`lorepanic pull\` to restore it before deciding to delete.`,
-          );
-          stats.conflicts += 1;
-          continue;
-        }
-        throw e;
+    // Notes tracked in state whose local file disappeared.
+    for (const [id, entity] of Object.entries(state.entities)) {
+      if (entity.type !== "note" || seenIds.has(id)) continue;
+      const file = entity.files["content"];
+      if (!file) continue;
+      const abs = safeResolve(root, file.path);
+      if (!abs) {
+        console.log(`  ! state entry for ${file.path} points outside the workspace; ignored`);
+        continue;
       }
-      delete state.entities[id];
-      console.log(`  - ${file.path} (deleted on server)`);
-      stats.deleted += 1;
-    } else {
-      console.log(`  ? ${file.path} deleted locally; use \`lorepanic push --prune\` to delete on the server, or \`lorepanic pull\` to restore it`);
+      if (existsSync(abs)) continue;
+      if (opts.prune) {
+        try {
+          await api.delete(
+            `/api/notes/${id}?expected_updated_at=${encodeURIComponent(entity.updated_at)}`,
+          );
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 409) {
+            console.log(
+              `  ! ${file.path}: the note changed on the server since your last pull; ` +
+                `run \`lorepanic pull\` to restore it before deciding to delete.`,
+            );
+            stats.conflicts += 1;
+            continue;
+          }
+          throw e;
+        }
+        delete state.entities[id];
+        saveState(root, state);
+        console.log(`  - ${file.path} (deleted on server)`);
+        stats.deleted += 1;
+      } else {
+        console.log(`  ? ${file.path} deleted locally; use \`lorepanic push --prune\` to delete on the server, or \`lorepanic pull\` to restore it`);
+      }
     }
+  } finally {
+    saveState(root, state);
   }
 
-  saveState(root, state);
   const summary = [
     `${stats.created} created`,
     `${stats.updated} updated`,
     `${stats.unchanged} unchanged`,
     stats.deleted > 0 ? `${stats.deleted} deleted` : null,
+    stats.skipped > 0 ? `${stats.skipped} skipped` : null,
     stats.conflicts > 0 ? `${stats.conflicts} conflict(s)` : null,
   ]
     .filter(Boolean)

@@ -31,7 +31,10 @@ export function loadCredentials(): Credentials | null {
 }
 
 export function saveCredentials(creds: Credentials): void {
-  mkdirSync(configDir(), { recursive: true });
+  mkdirSync(configDir(), { recursive: true, mode: 0o700 });
+  // mkdirSync's mode only applies to directories it creates; tighten an
+  // existing config dir too, since it holds a long-lived API token.
+  chmodSync(configDir(), 0o700);
   const path = credentialsPath();
   writeFileSync(path, JSON.stringify(creds, null, 2) + "\n", { mode: 0o600 });
   chmodSync(path, 0o600);

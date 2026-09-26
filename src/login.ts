@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { hostname } from "node:os";
 
-import { ApiClient, type DevicePoll, type DeviceStart } from "./api.js";
+import { ApiClient, ApiError, NetworkError, type DevicePoll, type DeviceStart } from "./api.js";
 import { DEFAULT_API_URL, deleteCredentials, saveCredentials } from "./config.js";
 
 const SCOPES = ["sync:read", "notes:write", "campaigns:read", "me:read"];
@@ -30,6 +30,9 @@ function openBrowser(url: string): void {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Consecutive network/5xx poll failures tolerated before giving up. */
+const MAX_POLL_FAILURES = 8;
+
 export async function login(apiUrl: string = DEFAULT_API_URL, noBrowser = false): Promise<void> {
   const api = new ApiClient(apiUrl);
   const start = await api.post<DeviceStart>("/api/cli/device/start", {
@@ -49,14 +52,52 @@ export async function login(apiUrl: string = DEFAULT_API_URL, noBrowser = false)
   const expiresAt = new Date(start.expires_at).getTime();
   let interval = Math.max(2, start.interval);
 
+  // Consecutive transient failures (network, 5xx); reset on any real answer.
+  let failures = 0;
+  let waitSeconds = interval;
+
   while (Date.now() < expiresAt) {
-    await sleep(interval * 1000);
+    await sleep(waitSeconds * 1000);
+    waitSeconds = interval;
     process.stdout.write(".");
-    const poll = await api.post<DevicePoll>("/api/cli/device/poll", {
-      device_code: start.device_code,
-    });
+    let poll: DevicePoll;
+    try {
+      poll = await api.post<DevicePoll>("/api/cli/device/poll", {
+        device_code: start.device_code,
+      });
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 429) {
+        // Rate limited: honor Retry-After and poll less often from now on.
+        interval = Math.min(interval + 5, 60);
+        waitSeconds = Math.max(interval, e.retryAfter ?? interval);
+        continue;
+      }
+      if (e instanceof ApiError && e.status === 400 && /slow_down/.test(e.body)) {
+        interval = Math.min(interval + 5, 60);
+        waitSeconds = interval;
+        continue;
+      }
+      const transient = e instanceof NetworkError || (e instanceof ApiError && e.status >= 500);
+      if (!transient) throw e;
+      failures += 1;
+      if (failures >= MAX_POLL_FAILURES) {
+        console.log("");
+        console.error(`Giving up after ${failures} failed attempts to reach LorePanic: ${(e as Error).message}`);
+        process.exit(1);
+      }
+      // Exponential backoff, capped so we still notice approval promptly.
+      waitSeconds = Math.min(interval * 2 ** failures, 60);
+      continue;
+    }
+    failures = 0;
+    if (poll.status === "slow_down") {
+      interval = Math.min(Math.max(interval + 5, poll.interval ?? 0), 60);
+      waitSeconds = interval;
+      continue;
+    }
     if (poll.status === "pending") {
       if (poll.interval) interval = Math.max(2, poll.interval);
+      waitSeconds = interval;
       continue;
     }
     console.log("");
