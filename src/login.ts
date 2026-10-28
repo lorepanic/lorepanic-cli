@@ -1,21 +1,51 @@
 import { spawn } from "node:child_process";
 import { hostname } from "node:os";
 
-import { ApiClient, ApiError, NetworkError, type DevicePoll, type DeviceStart } from "./api.js";
+import {
+  ApiClient,
+  ApiError,
+  NetworkError,
+  normalizeApiUrl,
+  type DevicePoll,
+  type DeviceStart,
+} from "./api.js";
 import { DEFAULT_API_URL, deleteCredentials, saveCredentials } from "./config.js";
 
 const SCOPES = ["sync:read", "notes:write", "campaigns:read", "me:read"];
 
-function openBrowser(url: string): void {
-  // `start` is a cmd built-in, not an executable, so Windows goes through
-  // cmd /c. Spawn failures surface as async 'error' events; without the
-  // listener they would crash the process instead of falling back to the
-  // printed URL.
+/**
+ * The verification URL comes from the server. Only hand it to the OS opener
+ * if it is a plain web URL on the same host as the API (the frontend may sit
+ * on another port in dev): `open`/`xdg-open` accept any scheme, and cmd.exe
+ * would interpret `&`, `|` or `^` in it as command syntax.
+ */
+function safeBrowserUrl(raw: string, apiUrl: string): string | null {
+  try {
+    const url = new URL(raw);
+    const api = new URL(apiUrl);
+    const schemeOk = url.protocol === "https:" || (url.protocol === "http:" && api.protocol === "http:");
+    if (!schemeOk || url.hostname !== api.hostname || url.username || url.password) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function openBrowser(raw: string, apiUrl: string): void {
+  const url = safeBrowserUrl(raw, apiUrl);
+  if (!url) {
+    console.log("  (Not opening that URL automatically: it does not match the API host.)");
+    return;
+  }
+  // Windows: rundll32's URL handler takes the URL as a single argument, so
+  // nothing goes through cmd.exe parsing (unlike `cmd /c start`). Spawn
+  // failures surface as async 'error' events; without the listener they
+  // would crash the process instead of falling back to the printed URL.
   const [cmd, args] =
     process.platform === "darwin"
       ? ["open", [url]]
       : process.platform === "win32"
-        ? ["cmd", ["/c", "start", "", url]]
+        ? ["rundll32", ["url.dll,FileProtocolHandler", url]]
         : ["xdg-open", [url]];
   try {
     const child = spawn(cmd as string, args as string[], { detached: true, stdio: "ignore" });
@@ -33,7 +63,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Consecutive network/5xx poll failures tolerated before giving up. */
 const MAX_POLL_FAILURES = 8;
 
-export async function login(apiUrl: string = DEFAULT_API_URL, noBrowser = false): Promise<void> {
+export async function login(rawApiUrl: string = DEFAULT_API_URL, noBrowser = false): Promise<void> {
+  const apiUrl = normalizeApiUrl(rawApiUrl);
   const api = new ApiClient(apiUrl);
   const start = await api.post<DeviceStart>("/api/cli/device/start", {
     client_name: `LorePanic CLI on ${hostname()}`,
@@ -46,7 +77,7 @@ export async function login(apiUrl: string = DEFAULT_API_URL, noBrowser = false)
   console.log("  Approve this connection in your browser:");
   console.log(`  ${start.verification_url_complete}`);
   console.log("");
-  if (!noBrowser) openBrowser(start.verification_url_complete);
+  if (!noBrowser) openBrowser(start.verification_url_complete, apiUrl);
   process.stdout.write("  Waiting for approval");
 
   const expiresAt = new Date(start.expires_at).getTime();

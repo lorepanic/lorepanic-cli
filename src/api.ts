@@ -22,11 +22,57 @@ function parseRetryAfter(value: string | null): number | null {
   return null;
 }
 
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * Validate and canonicalize an API base URL. The long-lived token is sent to
+ * this origin, so it must be https (plain http only for a local dev server),
+ * carry no credentials, query or fragment.
+ */
+export function normalizeApiUrl(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`Invalid API URL: ${raw}`);
+  }
+  const loopback = LOOPBACK_HOSTS.has(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new Error(`Refusing API URL ${raw.slice(0, 100)}: use https:// (http:// is only allowed for localhost).`);
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error("The API URL must not contain credentials, a query string or a fragment.");
+  }
+  return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+}
+
 export class ApiClient {
+  private baseUrl: string;
+  private origin: string;
+
   constructor(
-    private baseUrl: string,
+    baseUrl: string,
     private token?: string,
-  ) {}
+  ) {
+    this.baseUrl = normalizeApiUrl(baseUrl);
+    this.origin = new URL(this.baseUrl).origin;
+  }
+
+  /**
+   * Resolve an API path (ours, or a server-provided one such as a manifest
+   * content_url) against the base URL, and refuse anything that would leave
+   * its origin: the Authorization header must never go to another host.
+   */
+  private resolve(path: string): string {
+    if (!path.startsWith("/") || path.startsWith("//")) {
+      throw new Error(`Refusing non-relative API path: ${path.slice(0, 200)}`);
+    }
+    const url = new URL(`${this.baseUrl}${path}`);
+    if (url.origin !== this.origin) {
+      throw new Error(`Refusing request outside ${this.origin}: ${url.origin}`);
+    }
+    return url.toString();
+  }
 
   private headers(json = false): Record<string, string> {
     const h: Record<string, string> = {};
@@ -38,7 +84,7 @@ export class ApiClient {
   private async request(method: string, path: string, body?: unknown): Promise<Response> {
     let res: Response;
     try {
-      res = await fetch(`${this.baseUrl}${path}`, {
+      res = await fetch(this.resolve(path), {
         method,
         headers: this.headers(body !== undefined),
         body: body !== undefined ? JSON.stringify(body) : undefined,
